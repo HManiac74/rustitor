@@ -1,7 +1,7 @@
-use std::fmt;
 use std::io::{self, Read, Write};
 use std::ops::{Deref, DerefMut};
 use std::os::unix::io::AsRawFd;
+use std::str;
 
 struct StdinRawMode {
     stdin: io::Stdin,
@@ -29,8 +29,8 @@ impl StdinRawMode {
         Ok(StdinRawMode { stdin, orig })
     }
 
-    fn input_keys(self) -> InputKeys {
-        InputKeys { stdin: self }
+    fn input_keys(self) -> InputSequences {
+        InputSequences { stdin: self }
     }
 }
 
@@ -61,64 +61,100 @@ enum SpecialKey {
     Down,
 }
 
-#[derive(PartialEq)]
-enum Key {
+#[derive(PartialEq, Debug)]
+enum InputSeq {
     Unidentified,
-    Ascii(u8, bool),
+    Key(u8, bool),
+    Cursor(usize, usize),
 }
 
-impl Key {
-    fn decode_ascii(b: u8) -> Key {
-        match b {
-            0x20..=0x7f => Key::Ascii(b, false),
-            0x01..=0x1f => Key::Ascii(b | 0b1100000, true),
-            _ => Key::Unidentified,
-        }
-    }
-}
-
-impl fmt::Debug for Key {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match *self {
-            Key::Unidentified => write!(f, "Key(Unidentified)"),
-            Key::Ascii(ch, true) => write!(f, "Key(Ctrl+{:?}, 0x{:x})", ch as char, ch),
-            Key::Ascii(ch, ..) => write!(f, "Key({:?}, 0x{:x})", ch as char, ch),
-        }
-    }
-}
-
-struct InputKeys {
+struct InputSequences {
     stdin: StdinRawMode,
 }
 
-impl InputKeys {
-    fn read_byte_with_timeout(&mut self) -> io::Result<u8> {
+impl InputSequences {
+    fn read(&mut self) -> io::Result<u8> {
         let mut one_byte: [u8; 1] = [0];
         self.stdin.read(&mut one_byte)?;
         Ok(one_byte[0])
     }
+
+    fn read_blocking(&mut self) -> io::Result<u8> {
+        let mut one_byte: [u8; 1] = [0];
+        loop {
+            if self.stdin.read(&mut one_byte)? > 0 {
+                return Ok(one_byte[0]);
+            }
+        }
+    }
+
+    fn decode(&mut self, b: u8) -> io::Result<InputSeq> {
+        match b {
+            0x1b => {
+                let b = self.read_blocking()?;
+                if b != b'[' {
+                    return self.decode(b);
+                }
+
+                let mut buf = vec![];
+                let cmd = loop {
+                    let b = self.read_blocking()?;
+                    match b {
+                        b'R' => break b,
+                        _ => buf.push(b),
+                    }
+                };
+
+                let args = buf.split(|b| *b == b';');
+                match cmd {
+                    b'R' => {
+                        let mut i = args
+                            .map(|b| str::from_utf8(b).ok().and_then(|s| s.parse::<usize>().ok()));
+                        match (i.next(), i.next()) {
+                            (Some(Some(r)), Some(Some(c))) => Ok(InputSeq::Cursor(r, c)),
+                            _ => Ok(InputSeq::Unidentified),
+                        }
+                    }
+                    _ => Ok(InputSeq::Unidentified),
+                }
+            }
+            0x20..=0x7f => Ok(InputSeq::Key(b, false)),
+            0x01..=0x1f => Ok(InputSeq::Key(b | 0b1100000, true)),
+            _ => Ok(InputSeq::Unidentified),
+        }
+    }
+
+    fn read_seq(&mut self) -> io::Result<InputSeq> {
+        let b = self.read()?;
+        self.decode(b)
+    }
 }
 
-impl Iterator for InputKeys {
-    type Item = io::Result<Key>;
+impl Iterator for InputSequences {
+    type Item = io::Result<InputSeq>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        Some(self.read_byte_with_timeout().map(Key::decode_ascii))
+        Some(self.read_seq())
     }
 }
 
 struct Editor {
-    // ToDo
+    screen_rows: usize,
+    screen_cols: usize,
 }
 
 impl Editor {
-    fn new() -> Editor {
-        Editor {}
+    fn new(size: Option<(usize, usize)>) -> Editor {
+        let (screen_cols, screen_rows) = size.unwrap_or((0, 0));
+        Editor {
+            screen_cols,
+            screen_rows,
+        }
     }
 
     fn write_rows<W: Write>(&self, mut w: W) -> io::Result<()> {
-
-        for _ in 0..24 {
+        // Draw screen
+        for _ in 0..self.screen_rows {
             w.write(b"~\r\n")?;
         }
         Ok(())
@@ -134,20 +170,45 @@ impl Editor {
         stdout.flush()
     }
 
-    fn process_keypress(&mut self, key: Key) -> io::Result<bool> {
-        match key {
-            Key::Ascii(b'q', true) => Ok(true),
+    fn process_sequence(&mut self, seq: InputSeq) -> io::Result<bool> {
+        match seq {
+            InputSeq::Key(b'q', true) => Ok(true),
             _ => Ok(false),
         }
     }
 
+    fn ensure_screen_size<I>(&mut self, mut input: I) -> io::Result<I>
+    where
+        I: Iterator<Item = io::Result<InputSeq>>,
+    {
+        if self.screen_cols > 0 && self.screen_rows > 0 {
+            return Ok(input);
+        }
+
+        let mut stdout = io::stdout();
+        stdout.write(b"\x1b[9999C\x1b[9999B\x1b[6n")?;
+        stdout.flush()?;
+
+        for seq in &mut input {
+            if let InputSeq::Cursor(r, c) = seq? {
+                self.screen_cols = c;
+                self.screen_rows = r;
+                break;
+            }
+        }
+
+        Ok(input)
+    }
+
     fn run<I>(&mut self, input: I) -> io::Result<()>
     where
-        I: Iterator<Item = io::Result<Key>>,
+        I: Iterator<Item = io::Result<InputSeq>>,
     {
-        for key in input {
+        let input = self.ensure_screen_size(input)?;
+
+        for seq in input {
             self.refresh_screen()?;
-            if self.process_keypress(key?)? {
+            if self.process_sequence(seq?)? {
                 break;
             }
         }
@@ -156,5 +217,5 @@ impl Editor {
 }
 
 fn main() -> io::Result<()> {
-    Editor::new().run(StdinRawMode::new()?.input_keys())
+    Editor::new(term_size::dimensions_stdout()).run(StdinRawMode::new()?.input_keys())
 }
