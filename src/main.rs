@@ -1,5 +1,5 @@
 use std::fmt;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::ops::{Deref, DerefMut};
 use std::os::unix::io::AsRawFd;
 
@@ -29,7 +29,7 @@ impl StdinRawMode {
         Ok(StdinRawMode { stdin, orig })
     }
 
-    fn input_keys(&mut self) -> InputKeys {
+    fn input_keys(self) -> InputKeys {
         InputKeys { stdin: self }
     }
 }
@@ -87,47 +87,74 @@ impl fmt::Debug for Key {
     }
 }
 
-struct InputKeys<'a> {
-    stdin: &'a mut StdinRawMode,
+struct InputKeys {
+    stdin: StdinRawMode,
 }
 
-impl<'a> InputKeys<'a> {
-    fn read_next_byte(&mut self) -> io::Result<u8> {
+impl InputKeys {
+    fn read_byte_with_timeout(&mut self) -> io::Result<u8> {
         let mut one_byte: [u8; 1] = [0];
         self.stdin.read(&mut one_byte)?;
         Ok(one_byte[0])
     }
 }
 
-impl<'a> Iterator for InputKeys<'a> {
+impl Iterator for InputKeys {
     type Item = io::Result<Key>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        Some(self.read_next_byte().map(Key::decode_ascii))
+        Some(self.read_byte_with_timeout().map(Key::decode_ascii))
     }
 }
 
 struct Editor {
-    stdin: StdinRawMode,
+    // ToDo
 }
 
 impl Editor {
-    fn new() -> io::Result<Editor> {
-        StdinRawMode::new().map(|stdin| Editor { stdin })
+    fn new() -> Editor {
+        Editor {}
     }
 
-    fn run(&mut self) -> io::Result<()> {
-        for input in self.stdin.input_keys() {
-            let key = input?;
-            print!("{:?}\r\n", key);
-            if key == Key::Ascii(b'q', true) {
+    fn write_rows<W: Write>(&self, mut w: W) -> io::Result<()> {
+
+        for _ in 0..24 {
+            w.write(b"~\r\n")?;
+        }
+        Ok(())
+    }
+
+    fn refresh_screen(&self) -> io::Result<()> {
+        let mut stdout = io::BufWriter::new(io::stdout());
+
+        stdout.write(b"\x1b[2J")?;
+        stdout.write(b"\x1b[H")?;
+        self.write_rows(&mut stdout)?;
+        stdout.write(b"\x1b[H")?;
+        stdout.flush()
+    }
+
+    fn process_keypress(&mut self, key: Key) -> io::Result<bool> {
+        match key {
+            Key::Ascii(b'q', true) => Ok(true),
+            _ => Ok(false),
+        }
+    }
+
+    fn run<I>(&mut self, input: I) -> io::Result<()>
+    where
+        I: Iterator<Item = io::Result<Key>>,
+    {
+        for key in input {
+            self.refresh_screen()?;
+            if self.process_keypress(key?)? {
                 break;
             }
         }
-        Ok(())
+        self.refresh_screen()
     }
 }
 
 fn main() -> io::Result<()> {
-    Editor::new()?.run()
+    Editor::new().run(StdinRawMode::new()?.input_keys())
 }
