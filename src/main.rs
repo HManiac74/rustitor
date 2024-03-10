@@ -1,7 +1,9 @@
 use std::cmp;
-use std::io::{self, Read, Write};
+use std::fs;
+use std::io::{self, BufRead, Read, Write};
 use std::ops::{Deref, DerefMut};
 use std::os::unix::io::AsRawFd;
+use std::path::Path;
 use std::str;
 
 const VERSION: &'static str = env!("CARGO_PKG_VERSION");
@@ -14,24 +16,24 @@ struct StdinRawMode {
 impl StdinRawMode {
     fn new() -> io::Result<StdinRawMode> {
         use termios::*;
-
+        
         let stdin = io::stdin();
         let fd = stdin.as_raw_fd();
         let mut termios = Termios::from_fd(fd)?;
         let orig = termios.clone();
-
+        
         termios.c_lflag &= !(ECHO | ICANON | ISIG | IEXTEN);
         termios.c_iflag &= !(IXON | ICRNL | BRKINT | INPCK | ISTRIP);
         termios.c_oflag &= !OPOST;
         termios.c_cflag |= CS8;
         termios.c_cc[VMIN] = 0;
         termios.c_cc[VTIME] = 1;
-
+        
         tcsetattr(fd, TCSAFLUSH, &mut termios)?;
-
+        
         Ok(StdinRawMode { stdin, orig })
     }
-
+    
     fn input_keys(self) -> InputSequences {
         InputSequences { stdin: self }
     }
@@ -45,7 +47,7 @@ impl Drop for StdinRawMode {
 
 impl Deref for StdinRawMode {
     type Target = io::Stdin;
-
+    
     fn deref(&self) -> &Self::Target {
         &self.stdin
     }
@@ -83,7 +85,7 @@ impl InputSequences {
         self.stdin.read(&mut one_byte)?;
         Ok(one_byte[0])
     }
-
+    
     fn read_blocking(&mut self) -> io::Result<u8> {
         let mut one_byte: [u8; 1] = [0];
         loop {
@@ -92,17 +94,17 @@ impl InputSequences {
             }
         }
     }
-
+    
     fn decode(&mut self, b: u8) -> io::Result<InputSeq> {
         match b {
             0x1b => {
-
+                
                 match self.read()? {
                     b'[' => {  }
                     0 => return Ok(InputSeq::Key(0x1b, false)),
                     b => return self.decode(b),
                 };
-
+                
                 let mut buf = vec![];
                 let cmd = loop {
                     let b = self.read_blocking()?;
@@ -119,12 +121,12 @@ impl InputSequences {
                         _ => buf.push(b),
                     }
                 };
-
+                
                 let mut args = buf.split(|b| *b == b';');
                 match cmd {
                     b'R' => {
                         let mut i = args
-                            .map(|b| str::from_utf8(b).ok().and_then(|s| s.parse::<usize>().ok()));
+                        .map(|b| str::from_utf8(b).ok().and_then(|s| s.parse::<usize>().ok()));
                         match (i.next(), i.next()) {
                             (Some(Some(r)), Some(Some(c))) => Ok(InputSeq::Cursor(r, c)),
                             _ => Ok(InputSeq::Unidentified),
@@ -155,7 +157,7 @@ impl InputSequences {
             _ => Ok(InputSeq::Unidentified),
         }
     }
-
+    
     fn read_seq(&mut self) -> io::Result<InputSeq> {
         let b = self.read()?;
         self.decode(b)
@@ -164,10 +166,14 @@ impl InputSequences {
 
 impl Iterator for InputSequences {
     type Item = io::Result<InputSeq>;
-
+    
     fn next(&mut self) -> Option<Self::Item> {
         Some(self.read_seq())
     }
+}
+
+struct Row {
+    text: String,
 }
 
 enum CursorDir {
@@ -178,11 +184,13 @@ enum CursorDir {
 }
 
 struct Editor {
-
+    
     cx: usize,
     cy: usize,
     screen_rows: usize,
     screen_cols: usize,
+    row: Vec<Row>,
+    rowoff: usize,
 }
 
 impl Editor {
@@ -193,59 +201,80 @@ impl Editor {
             cy: 0,
             screen_cols,
             screen_rows,
+            row: Vec::with_capacity(screen_rows),
+            rowoff: 0,
+        }
+    }
+
+    fn trim_line<'a, S: AsRef<str>>(&self, line: &'a S) -> &'a str {
+        let line = line.as_ref();
+        if line.len() > self.screen_cols {
+            &line[..self.screen_cols]
+        } else {
+            line
         }
     }
 
     fn write_rows<W: Write>(&self, mut buf: W) -> io::Result<()> {
         for y in 0..self.screen_rows {
-            if y == self.screen_rows / 3 {
-                let msg_buf = format!("Rubys Rust Editor -- Version {}", VERSION);
-                let mut welcome = msg_buf.as_str();
-                if welcome.len() > self.screen_cols {
-                    welcome = &welcome[..self.screen_cols];
-                }
-                let padding = (self.screen_cols - welcome.len()) / 2;
-                if padding > 0 {
-                    buf.write(b"~")?;
-                    for _ in 0..padding - 1 {
-                        buf.write(b" ")?;
+            if y >= self.row.len() {
+                if self.row.is_empty() && y == self.screen_rows / 3 {
+                    let msg_buf = format!("Kilo editor -- version {}", VERSION);
+                    let welcome = self.trim_line(&msg_buf);
+                    let padding = (self.screen_cols - welcome.len()) / 2;
+                    if padding > 0 {
+                        buf.write(b"~")?;
+                        for _ in 0..padding - 1 {
+                            buf.write(b" ")?;
+                        }
                     }
+                    buf.write(welcome.as_bytes())?;
+                } else {
+                    buf.write(b"~")?;
                 }
-                buf.write(welcome.as_bytes())?;
             } else {
-                buf.write(b"~")?;
+                let line = self.trim_line(&self.row[y].text);
+                buf.write(line.as_bytes())?;
             }
-
+            
             buf.write(b"\x1b[K")?;
-
+            
             if y < self.screen_rows - 1 {
                 buf.write(b"\r\n")?;
             }
         }
         Ok(())
     }
-
+    
     fn redraw_screen(&self) -> io::Result<()> {
         let mut buf = Vec::with_capacity((self.screen_rows + 1) * self.screen_cols);
-
+        
         buf.write(b"\x1b[?25l")?;
         buf.write(b"\x1b[H")?;
         self.write_rows(&mut buf)?;
-
+        
         write!(buf, "\x1b[{};{}H", self.cy + 1, self.cx + 1)?;
-
+        
         buf.write(b"\x1b[?25h")?;
-
+        
         let mut stdout = io::stdout();
         stdout.write(&buf)?;
         stdout.flush()
     }
-
+    
     fn clear_screen(&self) -> io::Result<()> {
         let mut stdout = io::stdout();
         stdout.write(b"\x1b[2J")?;
         stdout.write(b"\x1b[H")?;
         stdout.flush()
+    }
+
+    fn open_file<P: AsRef<Path>>(&mut self, file: P) -> io::Result<()> {
+        let file = fs::File::open(file)?;
+        for line in io::BufReader::new(file).lines() {
+            self.row.push(Row { text: line? });
+        }
+        Ok(())
     }
 
     fn move_cursor(&mut self, dir: CursorDir, delta: usize) {
@@ -256,7 +285,7 @@ impl Editor {
             CursorDir::Right => self.cx = cmp::min(self.cx + delta, self.screen_cols - 1),
         }
     }
-
+    
     fn process_sequence(&mut self, seq: InputSeq) -> io::Result<bool> {
         let mut exit = false;
         match seq {
@@ -276,7 +305,7 @@ impl Editor {
         }
         Ok(exit)
     }
-
+    
     fn ensure_screen_size<I>(&mut self, mut input: I) -> io::Result<I>
     where
         I: Iterator<Item = io::Result<InputSeq>>,
@@ -284,11 +313,11 @@ impl Editor {
         if self.screen_cols > 0 && self.screen_rows > 0 {
             return Ok(input);
         }
-
+        
         let mut stdout = io::stdout();
         stdout.write(b"\x1b[9999C\x1b[9999B\x1b[6n")?;
         stdout.flush()?;
-
+        
         for seq in &mut input {
             if let InputSeq::Cursor(r, c) = seq? {
                 self.screen_cols = c;
@@ -296,16 +325,16 @@ impl Editor {
                 break;
             }
         }
-
+        
         Ok(input)
     }
-
+    
     fn run<I>(&mut self, input: I) -> io::Result<()>
     where
         I: Iterator<Item = io::Result<InputSeq>>,
     {
         let input = self.ensure_screen_size(input)?;
-
+        
         for seq in input {
             self.redraw_screen()?;
             if self.process_sequence(seq?)? {
@@ -317,5 +346,9 @@ impl Editor {
 }
 
 fn main() -> io::Result<()> {
-    Editor::new(term_size::dimensions_stdout()).run(StdinRawMode::new()?.input_keys())
+    let mut editor = Editor::new(term_size::dimensions_stdout());
+    if let Some(arg) = std::env::args().skip(1).next() {
+        editor.open_file(arg)?;
+    }
+    editor.run(StdinRawMode::new()?.input_keys())
 }
