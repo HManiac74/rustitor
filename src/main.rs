@@ -24,7 +24,7 @@ impl StdinRawMode {
         termios.c_oflag &= !OPOST;
         termios.c_cflag |= CS8;
         termios.c_cc[VMIN] = 0;
-        termios.c_cc[VTIME] = 10;
+        termios.c_cc[VTIME] = 1;
 
         tcsetattr(fd, TCSAFLUSH, &mut termios)?;
 
@@ -56,6 +56,7 @@ impl DerefMut for StdinRawMode {
     }
 }
 
+#[derive(PartialEq, Debug)]
 enum SpecialKey {
     Left,
     Right,
@@ -66,6 +67,7 @@ enum SpecialKey {
 #[derive(PartialEq, Debug)]
 enum InputSeq {
     Unidentified,
+    SpecialKey(SpecialKey),
     Key(u8, bool),
     Cursor(usize, usize),
 }
@@ -102,7 +104,7 @@ impl InputSequences {
                 let cmd = loop {
                     let b = self.read_blocking()?;
                     match b {
-                        b'R' => break b,
+                        b'R' | b'A' | b'B' | b'C' | b'D' => break b,
                         _ => buf.push(b),
                     }
                 };
@@ -117,6 +119,10 @@ impl InputSequences {
                             _ => Ok(InputSeq::Unidentified),
                         }
                     }
+                    b'A' => Ok(InputSeq::SpecialKey(SpecialKey::Up)),
+                    b'B' => Ok(InputSeq::SpecialKey(SpecialKey::Down)),
+                    b'C' => Ok(InputSeq::SpecialKey(SpecialKey::Right)),
+                    b'D' => Ok(InputSeq::SpecialKey(SpecialKey::Left)),
                     _ => Ok(InputSeq::Unidentified),
                 }
             }
@@ -140,7 +146,17 @@ impl Iterator for InputSequences {
     }
 }
 
+enum CursorDir {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
 struct Editor {
+
+    cx: usize,
+    cy: usize,
     screen_rows: usize,
     screen_cols: usize,
 }
@@ -149,6 +165,8 @@ impl Editor {
     fn new(size: Option<(usize, usize)>) -> Editor {
         let (screen_cols, screen_rows) = size.unwrap_or((0, 0));
         Editor {
+            cx: 0,
+            cy: 0,
             screen_cols,
             screen_rows,
         }
@@ -157,7 +175,7 @@ impl Editor {
     fn write_rows<W: Write>(&self, mut buf: W) -> io::Result<()> {
         for y in 0..self.screen_rows {
             if y == self.screen_rows / 3 {
-                let msg_buf = format!("Rustitor editor -- version {}", VERSION);
+                let msg_buf = format!("Rubys Rust Editor -- Version {}", VERSION);
                 let mut welcome = msg_buf.as_str();
                 if welcome.len() > self.screen_cols {
                     welcome = &welcome[..self.screen_cols];
@@ -183,13 +201,17 @@ impl Editor {
         Ok(())
     }
 
-    fn refresh_screen(&self) -> io::Result<()> {
+    fn redraw_screen(&self) -> io::Result<()> {
         let mut buf = Vec::with_capacity((self.screen_rows + 1) * self.screen_cols);
 
         buf.write(b"\x1b[?25l")?;
         buf.write(b"\x1b[H")?;
         self.write_rows(&mut buf)?;
-        buf.write(b"\x1b[H")?;
+
+        // Move cursor
+        write!(buf, "\x1b[{};{}H", self.cy + 1, self.cx + 1)?;
+
+        // Reveal cursor again. 'h' is command to reset mode https://vt100.net/docs/vt100-ug/chapter3.html#RM
         buf.write(b"\x1b[?25h")?;
 
         let mut stdout = io::stdout();
@@ -197,11 +219,41 @@ impl Editor {
         stdout.flush()
     }
 
-    fn process_sequence(&mut self, seq: InputSeq) -> io::Result<bool> {
-        match seq {
-            InputSeq::Key(b'q', true) => Ok(true),
-            _ => Ok(false),
+    fn clear_screen(&self) -> io::Result<()> {
+        let mut stdout = io::stdout();
+        stdout.write(b"\x1b[2J")?;
+        stdout.write(b"\x1b[H")?;
+        stdout.flush()
+    }
+
+    fn move_cursor(&mut self, dir: CursorDir) {
+        match dir {
+            CursorDir::Up => self.cy = self.cy.saturating_sub(1),
+            CursorDir::Down => self.cy = self.cy.saturating_add(1),
+            CursorDir::Left => self.cx = self.cx.saturating_sub(1),
+            CursorDir::Right => self.cx = self.cx.saturating_add(1),
         }
+    }
+
+    fn process_sequence(&mut self, seq: InputSeq) -> io::Result<bool> {
+        let mut exit = false;
+        match seq {
+            InputSeq::Key(b'w', false) | InputSeq::SpecialKey(SpecialKey::Up) => {
+                self.move_cursor(CursorDir::Up)
+            }
+            InputSeq::Key(b'a', false) | InputSeq::SpecialKey(SpecialKey::Left) => {
+                self.move_cursor(CursorDir::Left)
+            }
+            InputSeq::Key(b's', false) | InputSeq::SpecialKey(SpecialKey::Down) => {
+                self.move_cursor(CursorDir::Down)
+            }
+            InputSeq::Key(b'd', false) | InputSeq::SpecialKey(SpecialKey::Right) => {
+                self.move_cursor(CursorDir::Right)
+            }
+            InputSeq::Key(b'q', true) => exit = true,
+            _ => {}
+        }
+        Ok(exit)
     }
 
     fn ensure_screen_size<I>(&mut self, mut input: I) -> io::Result<I>
@@ -234,12 +286,12 @@ impl Editor {
         let input = self.ensure_screen_size(input)?;
 
         for seq in input {
-            self.refresh_screen()?;
+            self.redraw_screen()?;
             if self.process_sequence(seq?)? {
                 break;
             }
         }
-        self.refresh_screen()
+        self.clear_screen()
     }
 }
 
