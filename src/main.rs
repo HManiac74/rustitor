@@ -3,6 +3,8 @@ use std::ops::{Deref, DerefMut};
 use std::os::unix::io::AsRawFd;
 use std::str;
 
+const VERSION: &'static str = env!("CARGO_PKG_VERSION");
+
 struct StdinRawMode {
     stdin: io::Stdin,
     orig: termios::Termios,
@@ -152,21 +154,46 @@ impl Editor {
         }
     }
 
-    fn write_rows<W: Write>(&self, mut w: W) -> io::Result<()> {
-        // Draw screen
-        for _ in 0..self.screen_rows {
-            w.write(b"~\r\n")?;
+    fn write_rows<W: Write>(&self, mut buf: W) -> io::Result<()> {
+        for y in 0..self.screen_rows {
+            if y == self.screen_rows / 3 {
+                let msg_buf = format!("Rustitor editor -- version {}", VERSION);
+                let mut welcome = msg_buf.as_str();
+                if welcome.len() > self.screen_cols {
+                    welcome = &welcome[..self.screen_cols];
+                }
+                let padding = (self.screen_cols - welcome.len()) / 2;
+                if padding > 0 {
+                    buf.write(b"~")?;
+                    for _ in 0..padding - 1 {
+                        buf.write(b" ")?;
+                    }
+                }
+                buf.write(welcome.as_bytes())?;
+            } else {
+                buf.write(b"~")?;
+            }
+
+            buf.write(b"\x1b[K")?;
+
+            if y < self.screen_rows - 1 {
+                buf.write(b"\r\n")?;
+            }
         }
         Ok(())
     }
 
     fn refresh_screen(&self) -> io::Result<()> {
-        let mut stdout = io::BufWriter::new(io::stdout());
+        let mut buf = Vec::with_capacity((self.screen_rows + 1) * self.screen_cols);
 
-        stdout.write(b"\x1b[2J")?;
-        stdout.write(b"\x1b[H")?;
-        self.write_rows(&mut stdout)?;
-        stdout.write(b"\x1b[H")?;
+        buf.write(b"\x1b[?25l")?;
+        buf.write(b"\x1b[H")?;
+        self.write_rows(&mut buf)?;
+        buf.write(b"\x1b[H")?;
+        buf.write(b"\x1b[?25h")?;
+
+        let mut stdout = io::stdout();
+        stdout.write(&buf)?;
         stdout.flush()
     }
 
