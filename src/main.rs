@@ -1,4 +1,3 @@
-use std::cmp;
 use std::fs;
 use std::io::{self, BufRead, Read, Write};
 use std::ops::{Deref, DerefMut};
@@ -126,7 +125,7 @@ impl InputSequences {
                 match cmd {
                     b'R' => {
                         let mut i = args
-                        .map(|b| str::from_utf8(b).ok().and_then(|s| s.parse::<usize>().ok()));
+                            .map(|b| str::from_utf8(b).ok().and_then(|s| s.parse::<usize>().ok()));
                         match (i.next(), i.next()) {
                             (Some(Some(r)), Some(Some(c))) => Ok(InputSeq::Cursor(r, c)),
                             _ => Ok(InputSeq::Unidentified),
@@ -191,6 +190,7 @@ struct Editor {
     screen_cols: usize,
     row: Vec<Row>,
     rowoff: usize,
+    coloff: usize,
 }
 
 impl Editor {
@@ -203,21 +203,28 @@ impl Editor {
             screen_rows,
             row: Vec::with_capacity(screen_rows),
             rowoff: 0,
+            coloff: 0,
         }
     }
 
     fn trim_line<'a, S: AsRef<str>>(&self, line: &'a S) -> &'a str {
-        let line = line.as_ref();
-        if line.len() > self.screen_cols {
-            &line[..self.screen_cols]
-        } else {
-            line
+        let mut line = line.as_ref();
+        if line.len() <= self.coloff {
+            return "";
         }
+        if self.coloff > 0 {
+            line = &line[self.coloff..];
+        }
+        if line.len() > self.screen_cols {
+            line = &line[..self.screen_cols]
+        }
+        line
     }
 
     fn write_rows<W: Write>(&self, mut buf: W) -> io::Result<()> {
         for y in 0..self.screen_rows {
-            if y >= self.row.len() {
+            let file_row = y + self.rowoff;
+            if file_row >= self.row.len() {
                 if self.row.is_empty() && y == self.screen_rows / 3 {
                     let msg_buf = format!("Kilo editor -- version {}", VERSION);
                     let welcome = self.trim_line(&msg_buf);
@@ -233,7 +240,7 @@ impl Editor {
                     buf.write(b"~")?;
                 }
             } else {
-                let line = self.trim_line(&self.row[y].text);
+                let line = self.trim_line(&self.row[file_row].text);
                 buf.write(line.as_bytes())?;
             }
             
@@ -252,8 +259,11 @@ impl Editor {
         buf.write(b"\x1b[?25l")?;
         buf.write(b"\x1b[H")?;
         self.write_rows(&mut buf)?;
+
+        let cursor_row = self.cy - self.rowoff + 1;
+        let cursor_col = self.cx - self.coloff + 1;
         
-        write!(buf, "\x1b[{};{}H", self.cy + 1, self.cx + 1)?;
+        write!(buf, "\x1b[{};{}H", cursor_row, cursor_col)?;
         
         buf.write(b"\x1b[?25h")?;
         
@@ -277,26 +287,51 @@ impl Editor {
         Ok(())
     }
 
-    fn move_cursor(&mut self, dir: CursorDir, delta: usize) {
-        match dir {
-            CursorDir::Up => self.cy = self.cy.saturating_sub(delta),
-            CursorDir::Down => self.cy = cmp::min(self.cy + delta, self.screen_rows - 1),
-            CursorDir::Left => self.cx = self.cx.saturating_sub(delta),
-            CursorDir::Right => self.cx = cmp::min(self.cx + delta, self.screen_cols - 1),
+    fn scroll(&mut self) {
+        if self.cy < self.rowoff {
+            self.rowoff = self.cy;
+        }
+        if self.cy >= self.rowoff + self.screen_rows {
+            self.rowoff = self.cy - self.screen_rows + 1;
+        }
+        if self.cx < self.coloff {
+            self.coloff = self.cx;
+        }
+        if self.cx >= self.coloff + self.screen_cols {
+            self.coloff = self.cx - self.screen_cols + 1;
         }
     }
-    
+
+    fn move_cursor(&mut self, dir: CursorDir) {
+        match dir {
+            CursorDir::Up => self.cy = self.cy.saturating_sub(1),
+            CursorDir::Down => {
+                if self.cy < self.row.len() - 1 {
+                    self.cy += 1;
+                }
+            }
+            CursorDir::Left => self.cx = self.cx.saturating_sub(1),
+            CursorDir::Right => self.cx += 1,
+        }
+    }
+
     fn process_sequence(&mut self, seq: InputSeq) -> io::Result<bool> {
         let mut exit = false;
         match seq {
-            InputSeq::Key(b'w', false) | InputSeq::UpKey => self.move_cursor(CursorDir::Up, 1),
-            InputSeq::Key(b'a', false) | InputSeq::LeftKey => self.move_cursor(CursorDir::Left, 1),
-            InputSeq::Key(b's', false) | InputSeq::DownKey => self.move_cursor(CursorDir::Down, 1),
-            InputSeq::Key(b'd', false) | InputSeq::RightKey => {
-                self.move_cursor(CursorDir::Right, 1)
+            InputSeq::Key(b'w', false) | InputSeq::UpKey => self.move_cursor(CursorDir::Up),
+            InputSeq::Key(b'a', false) | InputSeq::LeftKey => self.move_cursor(CursorDir::Left),
+            InputSeq::Key(b's', false) | InputSeq::DownKey => self.move_cursor(CursorDir::Down),
+            InputSeq::Key(b'd', false) | InputSeq::RightKey => self.move_cursor(CursorDir::Right),
+            InputSeq::PageUpKey => {
+                for _ in 0..self.screen_rows {
+                    self.move_cursor(CursorDir::Up);
+                }
             }
-            InputSeq::PageUpKey => self.move_cursor(CursorDir::Up, self.screen_rows),
-            InputSeq::PageDownKey => self.move_cursor(CursorDir::Down, self.screen_rows),
+            InputSeq::PageDownKey => {
+                for _ in 0..self.screen_rows {
+                    self.move_cursor(CursorDir::Down)
+                }
+            }
             InputSeq::HomeKey => self.cx = 0,
             InputSeq::EndKey => self.cx = self.screen_cols - 1,
             InputSeq::DeleteKey => unimplemented!("delete key press"),
@@ -305,7 +340,7 @@ impl Editor {
         }
         Ok(exit)
     }
-    
+
     fn ensure_screen_size<I>(&mut self, mut input: I) -> io::Result<I>
     where
         I: Iterator<Item = io::Result<InputSeq>>,
@@ -336,6 +371,7 @@ impl Editor {
         let input = self.ensure_screen_size(input)?;
         
         for seq in input {
+            self.scroll();
             self.redraw_screen()?;
             if self.process_sequence(seq?)? {
                 break;
