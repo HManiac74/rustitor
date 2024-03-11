@@ -305,13 +305,34 @@ impl Editor {
     fn move_cursor(&mut self, dir: CursorDir) {
         match dir {
             CursorDir::Up => self.cy = self.cy.saturating_sub(1),
+            CursorDir::Left => {
+                if self.cx > 0 {
+                    self.cx -= 1;
+                } else if self.cy > 0 {
+                    self.cy -= 1;
+                    self.cx = self.row[self.cy].text.len();
+                }
+            }
             CursorDir::Down => {
-                if self.cy < self.row.len() - 1 {
+                if self.cy < self.row.len() {
                     self.cy += 1;
                 }
             }
-            CursorDir::Left => self.cx = self.cx.saturating_sub(1),
-            CursorDir::Right => self.cx += 1,
+            CursorDir::Right => {
+                if self.cy < self.row.len() {
+                    let len = self.row[self.cy].text.len();
+                    if self.cx < len {
+                        self.cx += 1;
+                    } else if self.cx >= len {
+                        self.cy += 1;
+                        self.cx = 0;
+                    }
+                }
+            }
+        };
+        let len = self.row.get(self.cy).map(|r| r.text.len()).unwrap_or(0);
+        if self.cx > len {
+            self.cx = len;
         }
     }
 
