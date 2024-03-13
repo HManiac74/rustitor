@@ -1,3 +1,4 @@
+use std::cmp;
 use std::fs;
 use std::io::{self, BufRead, Read, Write};
 use std::ops::{Deref, DerefMut};
@@ -6,6 +7,7 @@ use std::path::Path;
 use std::str;
 
 const VERSION: &'static str = env!("CARGO_PKG_VERSION");
+const TAB_STOP: usize = 8;
 
 struct StdinRawMode {
     stdin: io::Stdin,
@@ -34,7 +36,10 @@ impl StdinRawMode {
     }
     
     fn input_keys(self) -> InputSequences {
-        InputSequences { stdin: self }
+        InputSequences {
+            stdin: self,
+            next_byte: 0,
+        }
     }
 }
 
@@ -76,6 +81,7 @@ enum InputSeq {
 
 struct InputSequences {
     stdin: StdinRawMode,
+    next_byte: u8,
 }
 
 impl InputSequences {
@@ -156,9 +162,15 @@ impl InputSequences {
             _ => Ok(InputSeq::Unidentified),
         }
     }
-    
+
     fn read_seq(&mut self) -> io::Result<InputSeq> {
-        let b = self.read()?;
+        let b = match self.next_byte {
+            0 => self.read()?,
+            b => {
+                self.next_byte = 0;
+                b
+            }
+        };
         self.decode(b)
     }
 }
@@ -172,7 +184,43 @@ impl Iterator for InputSequences {
 }
 
 struct Row {
-    text: String,
+    chars: String,
+    render: String,
+}
+
+impl Row {
+    fn new(line: String) -> Row {
+        let mut render = String::with_capacity(line.len());
+        let mut index = 0;
+        for c in line.chars() {
+            if c == '\t' {
+                loop {
+                    render.push(' ');
+                    index += 1;
+                    if index % TAB_STOP == 0 {
+                        break;
+                    }
+                }
+            } else {
+                render.push(c);
+                index += 1;
+            }
+        }
+        Row {
+            chars: line,
+            render,
+        }
+    }
+
+    fn rx_from_cx(&self, cx: usize) -> usize {
+        self.chars.chars().take(cx).fold(0, |rx, ch| {
+            if ch == '\t' {
+                rx + TAB_STOP - (rx % TAB_STOP)
+            } else {
+                rx + 1
+            }
+        })
+    }
 }
 
 enum CursorDir {
@@ -186,6 +234,9 @@ struct Editor {
     
     cx: usize,
     cy: usize,
+
+    rx: usize,
+
     screen_rows: usize,
     screen_cols: usize,
     row: Vec<Row>,
@@ -199,6 +250,7 @@ impl Editor {
         Editor {
             cx: 0,
             cy: 0,
+            rx: 0,
             screen_cols,
             screen_rows,
             row: Vec::with_capacity(screen_rows),
@@ -221,12 +273,12 @@ impl Editor {
         line
     }
 
-    fn write_rows<W: Write>(&self, mut buf: W) -> io::Result<()> {
+    fn draw_rows<W: Write>(&self, mut buf: W) -> io::Result<()> {
         for y in 0..self.screen_rows {
             let file_row = y + self.rowoff;
             if file_row >= self.row.len() {
                 if self.row.is_empty() && y == self.screen_rows / 3 {
-                    let msg_buf = format!("Kilo editor -- version {}", VERSION);
+                    let msg_buf = format!("Rustitor editor -- version {}", VERSION);
                     let welcome = self.trim_line(&msg_buf);
                     let padding = (self.screen_cols - welcome.len()) / 2;
                     if padding > 0 {
@@ -240,7 +292,7 @@ impl Editor {
                     buf.write(b"~")?;
                 }
             } else {
-                let line = self.trim_line(&self.row[file_row].text);
+                let line = self.trim_line(&self.row[file_row].render);
                 buf.write(line.as_bytes())?;
             }
             
@@ -252,16 +304,17 @@ impl Editor {
         }
         Ok(())
     }
-    
+
     fn redraw_screen(&self) -> io::Result<()> {
         let mut buf = Vec::with_capacity((self.screen_rows + 1) * self.screen_cols);
         
         buf.write(b"\x1b[?25l")?;
         buf.write(b"\x1b[H")?;
-        self.write_rows(&mut buf)?;
+
+        self.draw_rows(&mut buf)?;
 
         let cursor_row = self.cy - self.rowoff + 1;
-        let cursor_col = self.cx - self.coloff + 1;
+        let cursor_col = self.rx - self.coloff + 1;
         
         write!(buf, "\x1b[{};{}H", cursor_row, cursor_col)?;
         
@@ -282,23 +335,32 @@ impl Editor {
     fn open_file<P: AsRef<Path>>(&mut self, file: P) -> io::Result<()> {
         let file = fs::File::open(file)?;
         for line in io::BufReader::new(file).lines() {
-            self.row.push(Row { text: line? });
+            self.row.push(Row::new(line?));
         }
         Ok(())
     }
 
     fn scroll(&mut self) {
+
+        if self.cy < self.row.len() {
+            self.rx = self.row[self.cy].rx_from_cx(self.cx);
+        } else {
+            self.rx = 0;
+        }
+
         if self.cy < self.rowoff {
+
             self.rowoff = self.cy;
         }
         if self.cy >= self.rowoff + self.screen_rows {
+
             self.rowoff = self.cy - self.screen_rows + 1;
         }
-        if self.cx < self.coloff {
-            self.coloff = self.cx;
+        if self.rx < self.coloff {
+            self.coloff = self.rx;
         }
-        if self.cx >= self.coloff + self.screen_cols {
-            self.coloff = self.cx - self.screen_cols + 1;
+        if self.rx >= self.coloff + self.screen_cols {
+            self.coloff = self.rx - self.screen_cols + 1;
         }
     }
 
@@ -310,7 +372,7 @@ impl Editor {
                     self.cx -= 1;
                 } else if self.cy > 0 {
                     self.cy -= 1;
-                    self.cx = self.row[self.cy].text.len();
+                    self.cx = self.row[self.cy].chars.len();
                 }
             }
             CursorDir::Down => {
@@ -320,7 +382,7 @@ impl Editor {
             }
             CursorDir::Right => {
                 if self.cy < self.row.len() {
-                    let len = self.row[self.cy].text.len();
+                    let len = self.row[self.cy].chars.len();
                     if self.cx < len {
                         self.cx += 1;
                     } else if self.cx >= len {
@@ -330,7 +392,7 @@ impl Editor {
                 }
             }
         };
-        let len = self.row.get(self.cy).map(|r| r.text.len()).unwrap_or(0);
+        let len = self.row.get(self.cy).map(|r| r.chars.len()).unwrap_or(0);
         if self.cx > len {
             self.cx = len;
         }
@@ -344,17 +406,23 @@ impl Editor {
             InputSeq::Key(b's', false) | InputSeq::DownKey => self.move_cursor(CursorDir::Down),
             InputSeq::Key(b'd', false) | InputSeq::RightKey => self.move_cursor(CursorDir::Right),
             InputSeq::PageUpKey => {
+                self.cy = self.rowoff;
                 for _ in 0..self.screen_rows {
                     self.move_cursor(CursorDir::Up);
                 }
             }
             InputSeq::PageDownKey => {
+                self.cy = cmp::min(self.rowoff + self.screen_rows - 1, self.row.len());
                 for _ in 0..self.screen_rows {
                     self.move_cursor(CursorDir::Down)
                 }
             }
             InputSeq::HomeKey => self.cx = 0,
-            InputSeq::EndKey => self.cx = self.screen_cols - 1,
+            InputSeq::EndKey => {
+                if self.cy < self.row.len() {
+                    self.cx = self.screen_cols - 1;
+                }
+            }
             InputSeq::DeleteKey => unimplemented!("delete key press"),
             InputSeq::Key(b'q', true) => exit = true,
             _ => {}
