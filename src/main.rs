@@ -3,7 +3,7 @@ use std::fs;
 use std::io::{self, BufRead, Read, Write};
 use std::ops::{Deref, DerefMut};
 use std::os::unix::io::AsRawFd;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str;
 
 const VERSION: &'static str = env!("CARGO_PKG_VERSION");
@@ -107,7 +107,10 @@ impl InputSequences {
                 match self.read()? {
                     b'[' => {  }
                     0 => return Ok(InputSeq::Key(0x1b, false)),
-                    b => return self.decode(b),
+                    b => {
+                        self.next_byte = b;
+                        return  Ok(InputSeq::Key(0x1b, false));
+                    }
                 };
                 
                 let mut buf = vec![];
@@ -183,8 +186,23 @@ impl Iterator for InputSequences {
     }
 }
 
+struct FilePath {
+    path: PathBuf,
+    display: String,
+}
+
+impl FilePath {
+    fn from<P: AsRef<Path>>(path: P) -> FilePath {
+        let path = path.as_ref();
+        FilePath {
+            path: PathBuf::from(path),
+            display: path.to_string_lossy().to_string(),
+        }
+    }
+}
+
 struct Row {
-    chars: String,
+    buf: String,
     render: String,
 }
 
@@ -206,14 +224,11 @@ impl Row {
                 index += 1;
             }
         }
-        Row {
-            chars: line,
-            render,
-        }
+        Row { buf: line, render }
     }
 
     fn rx_from_cx(&self, cx: usize) -> usize {
-        self.chars.chars().take(cx).fold(0, |rx, ch| {
+        self.buf.chars().take(cx).fold(0, |rx, ch| {
             if ch == '\t' {
                 rx + TAB_STOP - (rx % TAB_STOP)
             } else {
@@ -232,6 +247,8 @@ enum CursorDir {
 
 struct Editor {
     
+    file: Option<FilePath>,
+
     cx: usize,
     cy: usize,
 
@@ -245,15 +262,16 @@ struct Editor {
 }
 
 impl Editor {
-    fn new(size: Option<(usize, usize)>) -> Editor {
-        let (screen_cols, screen_rows) = size.unwrap_or((0, 0));
+    fn new(window_size: Option<(usize, usize)>) -> Editor {
+        let (w, h) = window_size.unwrap_or((0, 0));
         Editor {
+            file: None,
             cx: 0,
             cy: 0,
             rx: 0,
-            screen_cols,
-            screen_rows,
-            row: Vec::with_capacity(screen_rows),
+            screen_cols: w,
+            screen_rows: h.saturating_sub(1),
+            row: Vec::with_capacity(h),
             rowoff: 0,
             coloff: 0,
         }
@@ -271,6 +289,45 @@ impl Editor {
             line = &line[..self.screen_cols]
         }
         line
+    }
+
+    fn draw_status_bar<W: Write>(&self, mut buf: W) -> io::Result<()> {
+        buf.write(b"\x1b[7m")?;
+
+        let file = if let Some(ref f) = self.file {
+            f.display.as_str()
+        } else {
+            "[No Name]"
+        };
+
+        let left = format!("{:<20?} - {} lines", file, self.row.len());
+        let left = if left.len() > self.screen_cols {
+            &left[..self.screen_cols]
+        } else {
+            left.as_str()
+        };
+        buf.write(left.as_bytes())?;
+
+        let rest_len = self.screen_cols - left.len();
+        if rest_len == 0 {
+            return Ok(());
+        }
+
+        let right = format!("{}/{}", self.cy, self.row.len());
+        if right.len() > rest_len {
+            for _ in 0..rest_len {
+                buf.write(b" ")?;
+            }
+            return Ok(());
+        }
+
+        for _ in 0..rest_len - right.len() {
+            buf.write(b" ")?;
+        }
+        buf.write(right.as_bytes())?;
+
+        buf.write(b"\x1b[m")?;
+        Ok(())
     }
 
     fn draw_rows<W: Write>(&self, mut buf: W) -> io::Result<()> {
@@ -297,10 +354,7 @@ impl Editor {
             }
             
             buf.write(b"\x1b[K")?;
-            
-            if y < self.screen_rows - 1 {
-                buf.write(b"\r\n")?;
-            }
+            buf.write(b"\r\n")?;
         }
         Ok(())
     }
@@ -312,6 +366,7 @@ impl Editor {
         buf.write(b"\x1b[H")?;
 
         self.draw_rows(&mut buf)?;
+        self.draw_status_bar(&mut buf)?;
 
         let cursor_row = self.cy - self.rowoff + 1;
         let cursor_col = self.rx - self.coloff + 1;
@@ -332,11 +387,13 @@ impl Editor {
         stdout.flush()
     }
 
-    fn open_file<P: AsRef<Path>>(&mut self, file: P) -> io::Result<()> {
-        let file = fs::File::open(file)?;
+    fn open_file<P: AsRef<Path>>(&mut self, path: P) -> io::Result<()> {
+        let path = path.as_ref();
+        let file = fs::File::open(path)?;
         for line in io::BufReader::new(file).lines() {
             self.row.push(Row::new(line?));
         }
+        self.file = Some(FilePath::from(path));
         Ok(())
     }
 
@@ -372,7 +429,7 @@ impl Editor {
                     self.cx -= 1;
                 } else if self.cy > 0 {
                     self.cy -= 1;
-                    self.cx = self.row[self.cy].chars.len();
+                    self.cx = self.row[self.cy].buf.len();
                 }
             }
             CursorDir::Down => {
@@ -382,7 +439,7 @@ impl Editor {
             }
             CursorDir::Right => {
                 if self.cy < self.row.len() {
-                    let len = self.row[self.cy].chars.len();
+                    let len = self.row[self.cy].buf.len();
                     if self.cx < len {
                         self.cx += 1;
                     } else if self.cx >= len {
@@ -392,7 +449,7 @@ impl Editor {
                 }
             }
         };
-        let len = self.row.get(self.cy).map(|r| r.chars.len()).unwrap_or(0);
+        let len = self.row.get(self.cy).map(|r| r.buf.len()).unwrap_or(0);
         if self.cx > len {
             self.cx = len;
         }
