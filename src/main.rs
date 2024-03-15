@@ -5,6 +5,7 @@ use std::ops::{Deref, DerefMut};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::str;
+use std::time::SystemTime;
 
 const VERSION: &'static str = env!("CARGO_PKG_VERSION");
 const TAB_STOP: usize = 8;
@@ -109,7 +110,7 @@ impl InputSequences {
                     0 => return Ok(InputSeq::Key(0x1b, false)),
                     b => {
                         self.next_byte = b;
-                        return  Ok(InputSeq::Key(0x1b, false));
+                        return Ok(InputSeq::Key(0x1b, false));
                     }
                 };
                 
@@ -201,6 +202,20 @@ impl FilePath {
     }
 }
 
+struct StatusMessage {
+    message: String,
+    timestamp: SystemTime,
+}
+
+impl StatusMessage {
+    fn new(message: String) -> StatusMessage {
+        StatusMessage {
+            message,
+            timestamp: SystemTime::now(),
+        }
+    }
+}
+
 struct Row {
     buf: String,
     render: String,
@@ -259,6 +274,8 @@ struct Editor {
     row: Vec<Row>,
     rowoff: usize,
     coloff: usize,
+
+    message: Option<StatusMessage>,
 }
 
 impl Editor {
@@ -270,10 +287,11 @@ impl Editor {
             cy: 0,
             rx: 0,
             screen_cols: w,
-            screen_rows: h.saturating_sub(1),
+            screen_rows: h.saturating_sub(2),
             row: Vec::with_capacity(h),
             rowoff: 0,
             coloff: 0,
+            message: Some(StatusMessage::new("HELP: Ctrl-Q = quit".to_string())),
         }
     }
 
@@ -301,11 +319,7 @@ impl Editor {
         };
 
         let left = format!("{:<20?} - {} lines", file, self.row.len());
-        let left = if left.len() > self.screen_cols {
-            &left[..self.screen_cols]
-        } else {
-            left.as_str()
-        };
+        let left = &left[..cmp::min(left.len(), self.screen_cols)];
         buf.write(left.as_bytes())?;
 
         let rest_len = self.screen_cols - left.len();
@@ -327,6 +341,20 @@ impl Editor {
         buf.write(right.as_bytes())?;
 
         buf.write(b"\x1b[m")?;
+        buf.write(b"\r\n")?;
+        Ok(())
+    }
+
+    fn draw_message_bar<W: Write>(&self, mut buf: W) -> io::Result<()> {
+        if let Some(ref msg) = self.message {
+            if let Ok(d) = SystemTime::now().duration_since(msg.timestamp) {
+                if d.as_secs() < 5 {
+                    let msg = &msg.message[..cmp::min(msg.message.len(), self.screen_cols)];
+                    buf.write(msg.as_bytes())?;
+                }
+            }
+        }
+        buf.write(b"\x1b[K")?;
         Ok(())
     }
 
@@ -359,7 +387,7 @@ impl Editor {
         Ok(())
     }
 
-    fn redraw_screen(&self) -> io::Result<()> {
+    fn refresh_screen(&self) -> io::Result<()> {
         let mut buf = Vec::with_capacity((self.screen_rows + 1) * self.screen_cols);
         
         buf.write(b"\x1b[?25l")?;
@@ -367,6 +395,7 @@ impl Editor {
 
         self.draw_rows(&mut buf)?;
         self.draw_status_bar(&mut buf)?;
+        self.draw_message_bar(&mut buf)?;
 
         let cursor_row = self.cy - self.rowoff + 1;
         let cursor_col = self.rx - self.coloff + 1;
@@ -502,7 +531,7 @@ impl Editor {
         for seq in &mut input {
             if let InputSeq::Cursor(r, c) = seq? {
                 self.screen_cols = c;
-                self.screen_rows = r;
+                self.screen_rows = r.saturating_sub(2);
                 break;
             }
         }
@@ -518,7 +547,7 @@ impl Editor {
         
         for seq in input {
             self.scroll();
-            self.redraw_screen()?;
+            self.refresh_screen()?;
             if self.process_sequence(seq?)? {
                 break;
             }
