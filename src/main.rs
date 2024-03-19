@@ -453,7 +453,11 @@ impl Editor {
         let ref file = if let Some(ref file) = self.file {
             file
         } else {
+<<<<<<< HEAD
             self.message = StatusMessage::new("No file name".to_string());
+=======
+            self.message = StatusMessage::new("No file name". to_string());
+>>>>>>> 190044273afcff53039a5841d4f2e0391cf37422
             return Ok(());
         };
 
