@@ -118,7 +118,8 @@ impl InputSequences {
                 let cmd = loop {
                     let b = self.read_blocking()?;
                     match b {
-                        b'R' | b'A' | b'B' | b'C' | b'D' | b'~' | b'F' | b'H' => break b,
+                        b'A' | b'B' | b'C' | b'D' | b'F' | b'H' | b'K' | b'J' | b'R' | b'c'
+                        | b'f' | b'g' | b'h' | b'l' | b'm' | b'n' | b'q' | b'y' | b'~' => break b,
                         b'O' => {
                             buf.push(b'O');
                             let b = self.read_blocking()?;
@@ -203,14 +204,14 @@ impl FilePath {
 }
 
 struct StatusMessage {
-    message: String,
+    text: String,
     timestamp: SystemTime,
 }
 
 impl StatusMessage {
-    fn new(message: String) -> StatusMessage {
+    fn new(text: String) -> StatusMessage {
         StatusMessage {
-            message,
+            text,
             timestamp: SystemTime::now(),
         }
     }
@@ -223,23 +224,38 @@ struct Row {
 
 impl Row {
     fn new(line: String) -> Row {
-        let mut render = String::with_capacity(line.len());
+        let mut row = Row {
+            buf: line,
+            render: "".to_string(),
+        };
+        row.update_render();
+        row
+    }
+
+    fn empty() -> Row {
+        Row {
+            buf: "".to_string(),
+            render: "".to_string(),
+        }
+    }
+
+    fn update_render(&mut self) {
+        self.render = String::with_capacity(self.buf.len());
         let mut index = 0;
-        for c in line.chars() {
+        for c in self.buf.chars() {
             if c == '\t' {
                 loop {
-                    render.push(' ');
+                    self.render.push(' ');
                     index += 1;
                     if index % TAB_STOP == 0 {
-                        break;
+                        break;;
                     }
                 }
             } else {
-                render.push(c);
+                self.render.push(c);
                 index += 1;
             }
         }
-        Row { buf: line, render }
     }
 
     fn rx_from_cx(&self, cx: usize) -> usize {
@@ -275,7 +291,7 @@ struct Editor {
     rowoff: usize,
     coloff: usize,
 
-    message: Option<StatusMessage>,
+    message: StatusMessage,
 }
 
 impl Editor {
@@ -291,7 +307,7 @@ impl Editor {
             row: Vec::with_capacity(h),
             rowoff: 0,
             coloff: 0,
-            message: Some(StatusMessage::new("HELP: Ctrl-Q = quit".to_string())),
+            message: StatusMessage::new("HELP: Ctrl - S = Save | Ctrl-Q = quit".to_string()),
         }
     }
 
@@ -346,13 +362,10 @@ impl Editor {
     }
 
     fn draw_message_bar<W: Write>(&self, mut buf: W) -> io::Result<()> {
-        if let Some(ref msg) = self.message {
-            if let Ok(d) = SystemTime::now().duration_since(msg.timestamp) {
-                if d.as_secs() < 5 {
-                    let msg = &msg.message[..cmp::min(msg.message.len(), self.screen_cols)];
-                    buf.write(msg.as_bytes())?;
-                }
-            }
+        if let Ok(d) = SystemTime::now().duration_since(self.message.timestamp) {
+            if d.as_secs() < 5 {
+                let msg = &self.message.text[..cmp::min(self.message.text.len(), self.screen_cols)];
+                buf.write(msg.as_bytes())?;
         }
         buf.write(b"\x1b[K")?;
         Ok(())
@@ -426,6 +439,29 @@ impl Editor {
         Ok(())
     }
 
+    fn save(&mut self) -> io::Result<()> {
+        let ref file = if let Some (ref file) = self.file {
+            file
+        } else {
+            self.message = StatusMessage::new("No file name". to_string());
+            return OK(());
+        };
+
+        let mut f = io::BufWriter::new(fs::File::create(&file.path)?);
+        let mut bytes = 0;
+        for line in self.row.iter() {
+            let b = line.buf.as_bytes();
+            f.write(b)?;
+            f.write(b"\n")?;
+            bytes += b.len() + 1;
+        }
+        f.flush()?;
+
+        let msg = format!("{} bytes written to {}", bytes, &file.display);
+        self.message = StatusMessage::new(msg);
+        Ok(())
+    }
+
     fn scroll(&mut self) {
 
         if self.cy < self.row.len() {
@@ -448,6 +484,14 @@ impl Editor {
         if self.rx >= self.coloff + self.screen_cols {
             self.coloff = self.rx - self.screen_cols + 1;
         }
+    }
+
+    fn insert_char(&mut self, ch: char) {
+        if self.cy == self.row.len() {
+            self.row.push(Row::empty());
+        }
+        self.row[self.cy].insert_char(self.cx, ch);
+        self.cx += 1;
     }
 
     fn move_cursor(&mut self, dir: CursorDir) {
@@ -484,13 +528,13 @@ impl Editor {
         }
     }
 
-    fn process_sequence(&mut self, seq: InputSeq) -> io::Result<bool> {
+    fn process_keypress(&mut self, seq: InputSeq) -> io::Result<bool> {
         let mut exit = false;
         match seq {
-            InputSeq::Key(b'w', false) | InputSeq::UpKey => self.move_cursor(CursorDir::Up),
-            InputSeq::Key(b'a', false) | InputSeq::LeftKey => self.move_cursor(CursorDir::Left),
-            InputSeq::Key(b's', false) | InputSeq::DownKey => self.move_cursor(CursorDir::Down),
-            InputSeq::Key(b'd', false) | InputSeq::RightKey => self.move_cursor(CursorDir::Right),
+            InputSeq::UpKey => self.move_cursor(CursorDir::Up),
+            InputSeq::LeftKey => self.move_cursor(CursorDir::Left),
+            InputSeq::DownKey => self.move_cursor(CursorDir::Down),
+            InputSeq::RightKey => self.move_cursor(CursorDir::Right),
             InputSeq::PageUpKey => {
                 self.cy = self.rowoff;
                 for _ in 0..self.screen_rows {
@@ -511,6 +555,14 @@ impl Editor {
             }
             InputSeq::DeleteKey => unimplemented!("delete key press"),
             InputSeq::Key(b'q', true) => exit = true,
+            InputSeq::Key(b'\r', false) => unimplemented!(),
+            InputSeq::Key(b'h', true) | InputSeq::Key(0x08, false) | InputSeq::Key(0x1f, false) => {
+                unimplemented!();
+            }
+            InputSeq::Key(b'l', true) | InputSeq::Key(0x1b, false) => {
+            }
+            InputSeq::Key(b's', true) => self.save()?,
+            InputSeq::Key(b, false) => self.insert_char(b as char),
             _ => {}
         }
         Ok(exit)
@@ -548,7 +600,7 @@ impl Editor {
         for seq in input {
             self.scroll();
             self.refresh_screen()?;
-            if self.process_sequence(seq?)? {
+            if self.process_keypress(seq?)? {
                 break;
             }
         }
