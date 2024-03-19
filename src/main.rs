@@ -32,10 +32,10 @@ impl StdinRawMode {
         termios.c_cc[VTIME] = 1;
         
         tcsetattr(fd, TCSAFLUSH, &mut termios)?;
-        
+
         Ok(StdinRawMode { stdin, orig })
     }
-    
+
     fn input_keys(self) -> InputSequences {
         InputSequences {
             stdin: self,
@@ -52,7 +52,7 @@ impl Drop for StdinRawMode {
 
 impl Deref for StdinRawMode {
     type Target = io::Stdin;
-    
+
     fn deref(&self) -> &Self::Target {
         &self.stdin
     }
@@ -91,7 +91,7 @@ impl InputSequences {
         self.stdin.read(&mut one_byte)?;
         Ok(one_byte[0])
     }
-    
+
     fn read_blocking(&mut self) -> io::Result<u8> {
         let mut one_byte: [u8; 1] = [0];
         loop {
@@ -100,7 +100,7 @@ impl InputSequences {
             }
         }
     }
-    
+
     fn decode(&mut self, b: u8) -> io::Result<InputSeq> {
         match b {
             0x1b => {
@@ -131,7 +131,7 @@ impl InputSequences {
                         _ => buf.push(b),
                     }
                 };
-                
+
                 let mut args = buf.split(|b| *b == b';');
                 match cmd {
                     b'R' => {
@@ -375,8 +375,8 @@ impl Editor {
             if d.as_secs() < 5 {
                 let msg = &self.message.text[..cmp::min(self.message.text.len(), self.screen_cols)];
                 buf.write(msg.as_bytes())?;
+            }
         }
-    }
         buf.write(b"\x1b[K")?;
         Ok(())
     }
@@ -422,16 +422,15 @@ impl Editor {
 
         let cursor_row = self.cy - self.rowoff + 1;
         let cursor_col = self.rx - self.coloff + 1;
-        
         write!(buf, "\x1b[{};{}H", cursor_row, cursor_col)?;
         
         buf.write(b"\x1b[?25h")?;
-        
+
         let mut stdout = io::stdout();
         stdout.write(&buf)?;
         stdout.flush()
     }
-    
+
     fn clear_screen(&self) -> io::Result<()> {
         let mut stdout = io::stdout();
         stdout.write(b"\x1b[2J")?;
@@ -453,11 +452,7 @@ impl Editor {
         let ref file = if let Some(ref file) = self.file {
             file
         } else {
-<<<<<<< HEAD
             self.message = StatusMessage::new("No file name".to_string());
-=======
-            self.message = StatusMessage::new("No file name". to_string());
->>>>>>> 190044273afcff53039a5841d4f2e0391cf37422
             return Ok(());
         };
 
@@ -601,16 +596,16 @@ impl Editor {
                 break;
             }
         }
-        
+
         Ok(input)
     }
-    
+
     fn run<I>(&mut self, input: I) -> io::Result<()>
     where
         I: Iterator<Item = io::Result<InputSeq>>,
     {
         let input = self.ensure_screen_size(input)?;
-        
+
         for seq in input {
             self.scroll();
             self.refresh_screen()?;
@@ -618,6 +613,7 @@ impl Editor {
                 break;
             }
         }
+
         self.clear_screen()
     }
 }
