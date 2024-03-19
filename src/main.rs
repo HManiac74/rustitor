@@ -248,7 +248,7 @@ impl Row {
                     self.render.push(' ');
                     index += 1;
                     if index % TAB_STOP == 0 {
-                        break;;
+                        break;
                     }
                 }
             } else {
@@ -266,6 +266,15 @@ impl Row {
                 rx + 1
             }
         })
+    }
+
+    fn insert_char(&mut self, at: usize, c: char) {
+        if self.buf.len() < at {
+            self.buf.push(c);
+        } else {
+            self.buf.insert(at, c);
+        }
+        self.update_render();
     }
 }
 
@@ -367,6 +376,7 @@ impl Editor {
                 let msg = &self.message.text[..cmp::min(self.message.text.len(), self.screen_cols)];
                 buf.write(msg.as_bytes())?;
         }
+    }
         buf.write(b"\x1b[K")?;
         Ok(())
     }
@@ -440,11 +450,11 @@ impl Editor {
     }
 
     fn save(&mut self) -> io::Result<()> {
-        let ref file = if let Some (ref file) = self.file {
+        let ref file = if let Some(ref file) = self.file {
             file
         } else {
             self.message = StatusMessage::new("No file name". to_string());
-            return OK(());
+            return Ok(());
         };
 
         let mut f = io::BufWriter::new(fs::File::create(&file.path)?);
