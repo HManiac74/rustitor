@@ -301,6 +301,8 @@ struct Editor {
     coloff: usize,
 
     message: StatusMessage,
+    dirty: bool,
+    quitting: bool,
 }
 
 impl Editor {
@@ -316,7 +318,9 @@ impl Editor {
             row: Vec::with_capacity(h),
             rowoff: 0,
             coloff: 0,
-            message: StatusMessage::new("HELP: Ctrl - S = Save | Ctrl-Q = quit".to_string()),
+            message: StatusMessage::new("HELP: Ctrl-S = save | Ctrl-Q = quit".to_string()),
+            dirty: false,
+            quitting: false,
         }
     }
 
@@ -343,7 +347,8 @@ impl Editor {
             "[No Name]"
         };
 
-        let left = format!("{:<20?} - {} lines", file, self.row.len());
+        let modified = if self.dirty { "(modified) " } else { "" };
+        let left = format!("{:<20?} - {} lines {}", file, self.row.len(), modified);
         let left = &left[..cmp::min(left.len(), self.screen_cols)];
         buf.write(left.as_bytes())?;
 
@@ -445,6 +450,7 @@ impl Editor {
             self.row.push(Row::new(line?));
         }
         self.file = Some(FilePath::from(path));
+        self.dirty = false;
         Ok(())
     }
 
@@ -468,10 +474,11 @@ impl Editor {
 
         let msg = format!("{} bytes written to {}", bytes, &file.display);
         self.message = StatusMessage::new(msg);
+        self.dirty = false;
         Ok(())
     }
 
-    fn scroll(&mut self) {
+    fn setup_scroll(&mut self) {
 
         if self.cy < self.row.len() {
             self.rx = self.row[self.cy].rx_from_cx(self.cx);
@@ -501,6 +508,7 @@ impl Editor {
         }
         self.row[self.cy].insert_char(self.cx, ch);
         self.cx += 1;
+        self.dirty = true;
     }
 
     fn move_cursor(&mut self, dir: CursorDir) {
@@ -538,12 +546,12 @@ impl Editor {
     }
 
     fn process_keypress(&mut self, seq: InputSeq) -> io::Result<bool> {
-        let mut exit = false;
+
         match seq {
-            InputSeq::UpKey => self.move_cursor(CursorDir::Up),
-            InputSeq::LeftKey => self.move_cursor(CursorDir::Left),
-            InputSeq::DownKey => self.move_cursor(CursorDir::Down),
-            InputSeq::RightKey => self.move_cursor(CursorDir::Right),
+            InputSeq::Key(b'p', true) | InputSeq::UpKey => self.move_cursor(CursorDir::Up),
+            InputSeq::Key(b'b', true) | InputSeq::LeftKey => self.move_cursor(CursorDir::Left),
+            InputSeq::Key(b'n', true) | InputSeq::DownKey => self.move_cursor(CursorDir::Down),
+            InputSeq::Key(b'f', true) | InputSeq::RightKey => self.move_cursor(CursorDir::Right),
             InputSeq::PageUpKey => {
                 self.cy = self.rowoff;
                 for _ in 0..self.screen_rows {
@@ -556,14 +564,24 @@ impl Editor {
                     self.move_cursor(CursorDir::Down)
                 }
             }
-            InputSeq::HomeKey => self.cx = 0,
-            InputSeq::EndKey => {
+            InputSeq::Key(b'a', true) | InputSeq::HomeKey => self.cx = 0,
+            InputSeq::Key(b'e', true) | InputSeq::EndKey => {
                 if self.cy < self.row.len() {
                     self.cx = self.screen_cols - 1;
                 }
             }
             InputSeq::DeleteKey => unimplemented!("delete key press"),
-            InputSeq::Key(b'q', true) => exit = true,
+            InputSeq::Key(b'q', true) => {
+                if self.quitting {
+                    return Ok(true);
+                } else {
+                    self.quitting = true;
+                    self.message = StatusMessage::new(
+                        "File has unsaved changes! Press Ctrl-Q again to quit".to_string(),
+                    );
+                    return Ok(false);
+                }
+            }
             InputSeq::Key(b'\r', false) => unimplemented!(),
             InputSeq::Key(b'h', true) | InputSeq::Key(0x08, false) | InputSeq::Key(0x1f, false) => {
                 unimplemented!();
@@ -572,8 +590,10 @@ impl Editor {
             }
             InputSeq::Key(b's', true) => self.save()?,
             InputSeq::Key(b, false) => self.insert_char(b as char),
-            _ => {}
+            InputSeq::Key(..) => { }
+            _ => unreachable!(),
         }
+        self.quitting = false;
         Ok(exit)
     }
 
@@ -606,12 +626,19 @@ impl Editor {
     {
         let input = self.ensure_screen_size(input)?;
 
+        self.setup_scroll();
+        self.refresh_screen()?;
+
         for seq in input {
-            self.scroll();
-            self.refresh_screen()?;
-            if self.process_keypress(seq?)? {
+            let seq = seq?;
+            if seq == InputSeq::Unidentified {
+                continue;
+            }
+            if self.process_keypress(seq)? {
                 break;
             }
+            self.setup_scroll();
+            self.refresh_screen()?;
         }
 
         self.clear_screen()
