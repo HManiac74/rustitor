@@ -594,7 +594,7 @@ impl Editor {
             _ => unreachable!(),
         }
         self.quitting = false;
-        Ok(exit)
+        Ok(false)
     }
 
     fn ensure_screen_size<I>(&mut self, mut input: I) -> io::Result<I>
