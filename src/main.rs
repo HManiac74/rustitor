@@ -209,7 +209,7 @@ struct StatusMessage {
 }
 
 impl StatusMessage {
-    fn new<S: Into<String>>(message: S)-> StatusMessage {
+    fn new<S: Into<String>>(message: S) -> StatusMessage {
         StatusMessage {
             text: message.into(),
             timestamp: SystemTime::now(),
@@ -269,11 +269,27 @@ impl Row {
     }
 
     fn insert_char(&mut self, at: usize, c: char) {
-        if self.buf.len() < at {
+        if self.buf.len() <= at {
             self.buf.push(c);
         } else {
             self.buf.insert(at, c);
         }
+        self.update_render();
+    }
+
+    fn delete_char(&mut self, at: usize) {
+        if at < self.buf.len() {
+            self.buf.remove(at);
+            self.update_render();
+        }
+    }
+
+    fn append<S: AsRef<str>>(&mut self, s: S) {
+        let s = s.as_ref();
+        if s.is_empty() {
+            return;
+        }
+        self.buf.push_str(s);
         self.update_render();
     }
 }
@@ -458,7 +474,7 @@ impl Editor {
         let ref file = if let Some(ref file) = self.file {
             file
         } else {
-            self.message = StatusMessage::new("Cannot save unamed buffer");
+            self.message = StatusMessage::new("Cannot save unnamed buffer");
             return Ok(());
         };
 
@@ -508,6 +524,22 @@ impl Editor {
         }
         self.row[self.cy].insert_char(self.cx, ch);
         self.cx += 1;
+        self.dirty = true;
+    }
+
+    fn delete_char(&mut self) {
+        if self.cy == self.row.len() || self.cx == 0 && self.cy == 0 {
+            return;
+        }
+        if self.cx > 0 {
+            self.row[self.cy].delete_char(self.cx-1);
+            self.cx -= 1;
+        } else {
+            self.cx = self.row[self.cy - 1].buf.len();
+            let row = self.row.remove(self.cy);
+            self.cy -= 1;
+            self.row[self.cy].append(row.buf);
+        }
         self.dirty = true;
     }
 
@@ -570,7 +602,11 @@ impl Editor {
                     self.cx = self.screen_cols - 1;
                 }
             }
-            InputSeq::DeleteKey => unimplemented!("delete key press"),
+            InputSeq::DeleteKey | InputSeq::Key(b'd', true)=> {
+                self.move_cursor(CursorDir::Right);
+                self.delete_char();
+            } 
+            
             InputSeq::Key(b'q', true) => {
                 if self.quitting {
                     return Ok(true);
@@ -582,8 +618,8 @@ impl Editor {
                 }
             }
             InputSeq::Key(b'\r', false) => unimplemented!(),
-            InputSeq::Key(b'h', true) | InputSeq::Key(0x08, false) | InputSeq::Key(0x1f, false) => {
-                unimplemented!();
+            InputSeq::Key(b'h', true) | InputSeq::Key(0x08, false) | InputSeq::Key(0x7f, false) => {
+                self.delete_char();
             }
             InputSeq::Key(b'l', true) | InputSeq::Key(0x1b, false) => {
             }
