@@ -292,6 +292,13 @@ impl Row {
         self.buf.push_str(s);
         self.update_render();
     }
+
+    fn truncate(&mut self, at: usize) {
+        if at < self.buf.len() {
+            self.buf.truncate(at);
+            self.update_render();
+        }
+    }
 }
 
 enum CursorDir {
@@ -532,7 +539,7 @@ impl Editor {
             return;
         }
         if self.cx > 0 {
-            self.row[self.cy].delete_char(self.cx-1);
+            self.row[self.cy].delete_char(self.cx - 1);
             self.cx -= 1;
         } else {
             self.cx = self.row[self.cy - 1].buf.len();
@@ -541,6 +548,20 @@ impl Editor {
             self.row[self.cy].append(row.buf);
         }
         self.dirty = true;
+    }
+
+    fn insert_line(&mut self) {
+        if self.cy >= self.row.len() {
+            self.row.push(Row::new(""));
+        } else if self.cx >= self.row[self.cy].buf.len() {
+            self.row.insert(self.cy + 1, Row::new(""));
+        } else {
+            let split = String::from(&self.row[self.cy].buf[self.cx..]);
+            self.row[self.cy].truncate(self.cx);
+            self.row.insert(self.cy + 1, Row::new(split));
+        }
+        self.cy += 1;
+        self.cx = 0;
     }
 
     fn move_cursor(&mut self, dir: CursorDir) {
@@ -602,7 +623,7 @@ impl Editor {
                     self.cx = self.screen_cols - 1;
                 }
             }
-            InputSeq::DeleteKey | InputSeq::Key(b'd', true)=> {
+            InputSeq::DeleteKey | InputSeq::Key(b'd', true) => {
                 self.move_cursor(CursorDir::Right);
                 self.delete_char();
             } 
@@ -617,7 +638,7 @@ impl Editor {
                     return Ok(false);
                 }
             }
-            InputSeq::Key(b'\r', false) => unimplemented!(),
+            InputSeq::Key(b'\r', false) | InputSeq::Key(b'm', true) => self.insert_line(),
             InputSeq::Key(b'h', true) | InputSeq::Key(0x08, false) | InputSeq::Key(0x7f, false) => {
                 self.delete_char();
             }
