@@ -86,7 +86,7 @@ struct InputSequences {
 }
 
 impl InputSequences {
-    fn read(&mut self) -> io::Result<u8> {
+    fn read_byte(&mut self) -> io::Result<u8> {
         let mut one_byte: [u8; 1] = [0];
         self.stdin.read(&mut one_byte)?;
         Ok(one_byte[0])
@@ -105,7 +105,7 @@ impl InputSequences {
         match b {
             0x1b => {
                 
-                match self.read()? {
+                match self.read_byte()? {
                     b'[' => {  }
                     0 => return Ok(InputSeq::Key(0x1b, false)),
                     b => {
@@ -170,7 +170,7 @@ impl InputSequences {
 
     fn read_seq(&mut self) -> io::Result<InputSeq> {
         let b = match self.next_byte {
-            0 => self.read()?,
+            0 => self.read_byte()?,
             b => {
                 self.next_byte = 0;
                 b
@@ -214,6 +214,10 @@ impl StatusMessage {
             text: message.into(),
             timestamp: SystemTime::now(),
         }
+    }
+
+    fn reset_timestamp(&mut self) {
+        self.timestamp = SystemTime::now();
     }
 }
 
@@ -308,7 +312,13 @@ enum CursorDir {
     Down,
 }
 
-struct Editor {
+#[derive(PartialEq)]
+enum AfterKeyPress {
+    Quit,
+    Continue,
+}
+struct Editor<I: Iterator<Item = io::Result<InputSeq>>> {
+    input: I,
     
     file: Option<FilePath>,
 
@@ -328,10 +338,11 @@ struct Editor {
     quitting: bool,
 }
 
-impl Editor {
-    fn new(window_size: Option<(usize, usize)>) -> Editor {
+impl<I: Iterator<Item = io::Result<InputSeq>>> Editor<I> {
+    fn new(window_size: Option<(usize, usize)>, input: I) -> Editor<I> {
         let (w, h) = window_size.unwrap_or((0, 0));
         Editor {
+            input,
             file: None,
             cx: 0,
             cy: 0,
@@ -478,10 +489,17 @@ impl Editor {
     }
 
     fn save(&mut self) -> io::Result<()> {
+        if self.file.is_none() {
+            if let Some(input) = self.prompt("Save as: ")? {
+                self.file = Some(FilePath {
+                    path: PathBuf::from(&input),
+                    display: input,
+                });
+            }
+        }
         let ref file = if let Some(ref file) = self.file {
             file
         } else {
-            self.message = StatusMessage::new("Cannot save unnamed buffer");
             return Ok(());
         };
 
@@ -598,7 +616,46 @@ impl Editor {
         }
     }
 
-    fn process_keypress(&mut self, seq: InputSeq) -> io::Result<bool> {
+    fn prompt<S: Into<String>>(&mut self, prompt: S) -> io::Result<Option<String>> {
+        let prompt = prompt.into();
+        let prompt_len = prompt.len();
+        self.message = StatusMessage::new(prompt);
+        self.refresh_screen()?;
+
+        while let Some(seq) = self.input.next() {
+            self.message.reset_timestamp();
+
+            match seq? {
+                InputSeq::Unidentified => continue,
+                InputSeq::Key(b'h', true) | InputSeq::Key(0x7f, false) | InputSeq::DeleteKey
+                    if self.message.text.len() > prompt_len => 
+                    {
+                        self.message.text.pop();
+                    }
+                InputSeq::Key(b'g', true) | InputSeq::Key(0x1b, false) => {
+                    self.message = StatusMessage::new("Canceled.");
+                    return Ok(None);
+                }
+                InputSeq::Key(b'\r', false) | InputSeq::Key(b'm', true) => break,
+                InputSeq::Key(b, false) => {
+                    self.message.text.push(b as char);
+                }
+                _ => continue,
+            }
+            self.refresh_screen()?;
+        }
+
+        let input = if self.message.text.len() > prompt_len {
+            Some(String::from(&self.message.text[prompt_len..]))
+        } else {
+            None
+        };
+
+        self.message.text.clear();
+        Ok(input)
+    }
+
+    fn process_keypress(&mut self, seq: InputSeq) -> io::Result<AfterKeyPress> {
 
         match seq {
             InputSeq::Key(b'p', true) | InputSeq::UpKey => self.move_cursor(CursorDir::Up),
@@ -629,13 +686,13 @@ impl Editor {
             } 
             
             InputSeq::Key(b'q', true) => {
-                if self.quitting {
-                    return Ok(true);
+                if !self.dirty || self.quitting {
+                    return Ok(AfterKeyPress::Quit);
                 } else {
                     self.quitting = true;
                     self.message = StatusMessage::new(
                         "File has unsaved changes! Press Ctrl-Q again to quit");
-                    return Ok(false);
+                    return Ok(AfterKeyPress::Continue);
                 }
             }
             InputSeq::Key(b'\r', false) | InputSeq::Key(b'm', true) => self.insert_line(),
@@ -650,61 +707,56 @@ impl Editor {
             _ => unreachable!(),
         }
         self.quitting = false;
-        Ok(false)
+        Ok(AfterKeyPress::Continue)
     }
 
-    fn ensure_screen_size<I>(&mut self, mut input: I) -> io::Result<I>
-    where
-        I: Iterator<Item = io::Result<InputSeq>>,
-    {
+    fn ensure_screen_size(&mut self) -> io::Result<()> {
         if self.screen_cols > 0 && self.screen_rows > 0 {
-            return Ok(input);
+            return Ok(());
         }
-        
+
         let mut stdout = io::stdout();
         stdout.write(b"\x1b[9999C\x1b[9999B\x1b[6n")?;
         stdout.flush()?;
-        
-        for seq in &mut input {
+
+        for seq in &mut self.input {
             if let InputSeq::Cursor(r, c) = seq? {
                 self.screen_cols = c;
                 self.screen_rows = r.saturating_sub(2);
                 break;
             }
         }
-
-        Ok(input)
+        Ok(())
     }
 
-    fn run<I>(&mut self, input: I) -> io::Result<()>
-    where
-        I: Iterator<Item = io::Result<InputSeq>>,
-    {
-        let input = self.ensure_screen_size(input)?;
+
+    fn run(&mut self) -> io::Result<()> {
+        self.ensure_screen_size()?;
 
         self.setup_scroll();
         self.refresh_screen()?;
 
-        for seq in input {
+        while let Some(seq) = self.input.next() {
             let seq = seq?;
             if seq == InputSeq::Unidentified {
                 continue;
             }
-            if self.process_keypress(seq)? {
+            if self.process_keypress(seq)? == AfterKeyPress::Quit {
                 break;
             }
             self.setup_scroll();
             self.refresh_screen()?;
         }
-
         self.clear_screen()
     }
 }
 
+
 fn main() -> io::Result<()> {
-    let mut editor = Editor::new(term_size::dimensions_stdout());
+    let input = StdinRawMode::new()?.input_keys();
+    let mut editor = Editor::new(term_size::dimensions_stdout(), input);
     if let Some(arg) = std::env::args().skip(1).next() {
         editor.open_file(arg)?;
     }
-    editor.run(StdinRawMode::new()?.input_keys())
+    editor.run()
 }
